@@ -1,0 +1,381 @@
+blueprint:
+  name: "Xiaomi Air Purifier – Reactive PM2.5 Control"
+  description: >
+    Reactive fan speed control for Xiaomi Air Purifier (via Xiaomi Miot Auto)
+    based on real-time PM2.5 readings. Reacts instantly to sensor state changes,
+    detects rapid PM2.5 spikes for temporary boost, applies hysteresis to prevent
+    oscillation, and enforces night mode speed limits. Designed as a smarter
+    replacement for the built-in Auto mode.
+  domain: automation
+  author: "ITLCI"
+  homeassistant:
+    min_version: "2024.6.0"
+  source_url: "https://github.com/ITLCI/ha-air-purifier-blueprint/blob/main/blueprint.yaml"
+  input:
+
+    # ── Device ────────────────────────────────────────────────────────────
+    fan_entity:
+      name: Air Purifier (fan entity)
+      selector:
+        entity:
+          domain: fan
+
+    favorite_level_entity:
+      name: Favorite Level (number)
+      description: >
+        Number entity exposed by Xiaomi Miot Auto,
+        usually number.<name>_favorite_level (range 0–14).
+      selector:
+        entity:
+          domain: number
+
+    # ── Sensors ───────────────────────────────────────────────────────────
+    pm25_sensor:
+      name: PM2.5 Sensor (primary)
+      description: >
+        Primary PM2.5 sensor. The automation reacts instantly
+        when this sensor's value changes. Can be the built-in
+        purifier sensor or an external one.
+      selector:
+        entity:
+          domain: sensor
+          device_class: pm25
+
+    pm25_sensor_fallback:
+      name: PM2.5 Sensor – Fallback (optional)
+      description: >
+        Used only when the primary sensor is unavailable.
+        Leave empty if not needed.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: pm25
+
+    # ── PM2.5 Thresholds (ug/m3) ─────────────────────────────────────────
+    threshold_medium:
+      name: "Threshold: Moderate"
+      description: PM2.5 level to enter moderate zone
+      default: 25
+      selector:
+        number:
+          min: 5
+          max: 100
+          step: 1
+          unit_of_measurement: "ug/m3"
+
+    threshold_high:
+      name: "Threshold: High"
+      default: 50
+      selector:
+        number:
+          min: 10
+          max: 150
+          step: 1
+          unit_of_measurement: "ug/m3"
+
+    threshold_very_high:
+      name: "Threshold: Very High"
+      default: 75
+      selector:
+        number:
+          min: 20
+          max: 200
+          step: 1
+          unit_of_measurement: "ug/m3"
+
+    hysteresis:
+      name: Hysteresis
+      description: >
+        PM2.5 must drop this many ug/m3 below a zone threshold
+        before the fan downshifts. Prevents oscillation.
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 25
+          step: 1
+          unit_of_measurement: "ug/m3"
+
+    # ── Fan Speeds (0–14) ─────────────────────────────────────────────────
+    speed_clean:
+      name: "Speed: Clean air"
+      description: Fan level when PM2.5 is below moderate threshold
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 14
+
+    speed_medium:
+      name: "Speed: Moderate"
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 14
+
+    speed_high:
+      name: "Speed: High"
+      default: 8
+      selector:
+        number:
+          min: 1
+          max: 14
+
+    speed_very_high:
+      name: "Speed: Very High"
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 14
+
+    # ── Spike Detection / Boost ───────────────────────────────────────────
+    spike_delta:
+      name: Spike detection threshold
+      description: >
+        PM2.5 increase (per single sensor update) that triggers
+        boost mode. Set to 0 to disable spike detection.
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "ug/m3"
+
+    speed_boost:
+      name: "Speed: Boost"
+      description: >
+        Fan speed applied when a rapid PM2.5 spike is detected.
+        Active for one cycle, then normal zone logic resumes.
+      default: 14
+      selector:
+        number:
+          min: 1
+          max: 14
+
+    # ── Night Mode ────────────────────────────────────────────────────────
+    night_mode_enabled:
+      name: Enable night mode
+      default: true
+      selector:
+        boolean:
+
+    night_start:
+      name: Night mode start
+      default: "22:30:00"
+      selector:
+        time:
+
+    night_end:
+      name: Night mode end
+      default: "07:00:00"
+      selector:
+        time:
+
+    night_max_speed:
+      name: Max speed at night
+      description: >
+        Hard cap on fan speed during night hours,
+        regardless of PM2.5 level or boost.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 14
+
+# ═══════════════════════════════════════════════════════════════════════════
+variables:
+  v_fan: !input fan_entity
+  v_fav_entity: !input favorite_level_entity
+  v_pm_primary: !input pm25_sensor
+  v_pm_fallback: !input pm25_sensor_fallback
+  v_thr_med: !input threshold_medium
+  v_thr_high: !input threshold_high
+  v_thr_vhigh: !input threshold_very_high
+  v_hyst: !input hysteresis
+  v_spd_clean: !input speed_clean
+  v_spd_med: !input speed_medium
+  v_spd_high: !input speed_high
+  v_spd_vhigh: !input speed_very_high
+  v_spike_delta: !input spike_delta
+  v_spd_boost: !input speed_boost
+  v_night_enabled: !input night_mode_enabled
+  v_night_start: !input night_start
+  v_night_end: !input night_end
+  v_night_max: !input night_max_speed
+
+  # Whether we have a valid PM2.5 reading from any sensor
+  v_pm25_valid: >
+    {% set primary = states(v_pm_primary) %}
+    {% if primary not in ['unavailable', 'unknown', 'none', ''] %}
+      {{ true }}
+    {% elif v_pm_fallback | string != ''
+        and states(v_pm_fallback) not in ['unavailable', 'unknown', 'none', ''] %}
+      {{ true }}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+  # Active PM2.5 reading (primary with fallback)
+  v_pm25: >
+    {% set primary = states(v_pm_primary) %}
+    {% if primary not in ['unavailable', 'unknown', 'none', ''] %}
+      {{ primary | float(0) }}
+    {% elif v_pm_fallback | string != ''
+        and states(v_pm_fallback) not in ['unavailable', 'unknown', 'none', ''] %}
+      {{ states(v_pm_fallback) | float(0) }}
+    {% else %}
+      {{ 0 }}
+    {% endif %}
+
+  # Current Favorite level set on the device
+  v_current_level: "{{ states(v_fav_entity) | int(1) }}"
+
+  # Night mode check (handles midnight crossing)
+  v_is_night: >
+    {% if not v_night_enabled %}
+      {{ false }}
+    {% else %}
+      {% set t = now().strftime('%H:%M:%S') %}
+      {% if v_night_start <= v_night_end %}
+        {{ t >= v_night_start and t < v_night_end }}
+      {% else %}
+        {{ t >= v_night_start or t < v_night_end }}
+      {% endif %}
+    {% endif %}
+
+  # Spike detection – only when fired by the sensor state trigger
+  v_is_spike: >
+    {% if trigger is defined
+       and trigger.id == 'sensor_update'
+       and trigger.from_state is defined
+       and trigger.to_state is defined
+       and v_spike_delta | int > 0 %}
+      {% set old_val = trigger.from_state.state | float(-1) %}
+      {% set new_val = trigger.to_state.state | float(-1) %}
+      {% if old_val >= 0 and new_val >= 0 %}
+        {{ (new_val - old_val) >= (v_spike_delta | float) }}
+      {% else %}
+        {{ false }}
+      {% endif %}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+  # Zone-based target level with hysteresis on downshift
+  v_target_level: >
+    {% set pm  = v_pm25 | float(0) %}
+    {% set cur = v_current_level | int %}
+    {% set h   = v_hyst | float %}
+
+    {# Current zone based on active fan level #}
+    {% if   cur <= v_spd_clean | int %} {% set zone_cur = 0 %}
+    {% elif cur <= v_spd_med | int   %} {% set zone_cur = 1 %}
+    {% elif cur <= v_spd_high | int  %} {% set zone_cur = 2 %}
+    {% else                          %} {% set zone_cur = 3 %}
+    {% endif %}
+
+    {# Raw target zone from PM2.5 #}
+    {% if   pm >= v_thr_vhigh | float %} {% set zone_raw = 3 %}
+    {% elif pm >= v_thr_high | float  %} {% set zone_raw = 2 %}
+    {% elif pm >= v_thr_med | float   %} {% set zone_raw = 1 %}
+    {% else                           %} {% set zone_raw = 0 %}
+    {% endif %}
+
+    {# Hysteresis: require PM2.5 to drop below (threshold - hysteresis)
+       before stepping down to a lower zone #}
+    {% if zone_raw < zone_cur %}
+      {% set boundaries = [0, v_thr_med | float, v_thr_high | float, v_thr_vhigh | float] %}
+      {% set boundary = boundaries[zone_cur] %}
+      {% if pm < (boundary - h) %}
+        {% set zone_final = zone_raw %}
+      {% else %}
+        {% set zone_final = zone_cur %}
+      {% endif %}
+    {% else %}
+      {% set zone_final = zone_raw %}
+    {% endif %}
+
+    {# Map zone → fan speed #}
+    {% if   zone_final == 0 %} {{ v_spd_clean | int }}
+    {% elif zone_final == 1 %} {{ v_spd_med | int }}
+    {% elif zone_final == 2 %} {{ v_spd_high | int }}
+    {% else                 %} {{ v_spd_vhigh | int }}
+    {% endif %}
+
+  # Apply boost if spike detected (take the higher of zone speed and boost)
+  v_boosted_level: >
+    {% if v_is_spike %}
+      {{ [v_target_level | int, v_spd_boost | int] | max }}
+    {% else %}
+      {{ v_target_level | int }}
+    {% endif %}
+
+  # Final level with night mode cap
+  v_final_level: >
+    {% set t = v_boosted_level | int %}
+    {% if v_is_night %}
+      {{ [t, v_night_max | int] | min }}
+    {% else %}
+      {{ t }}
+    {% endif %}
+
+# ═══════════════════════════════════════════════════════════════════════════
+trigger:
+  # Instant reaction when PM2.5 sensor value changes
+  - platform: state
+    entity_id: !input pm25_sensor
+    not_from:
+      - "unavailable"
+      - "unknown"
+    not_to:
+      - "unavailable"
+      - "unknown"
+    id: "sensor_update"
+
+  # Safety-net periodic re-evaluation (every 5 minutes)
+  - platform: time_pattern
+    minutes: "/5"
+    id: "periodic"
+
+# ═══════════════════════════════════════════════════════════════════════════
+condition:
+  # Purifier must be reachable
+  - condition: template
+    value_template: "{{ states(v_fan) not in ['unavailable', 'unknown'] }}"
+  # Purifier must be turned on
+  - condition: template
+    value_template: "{{ is_state(v_fan, 'on') }}"
+  # At least one PM2.5 sensor must be readable
+  - condition: template
+    value_template: "{{ v_pm25_valid }}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+action:
+  # 1. Switch to Favorite preset if not already active
+  - if:
+      - condition: template
+        value_template: >
+          {{ state_attr(v_fan, 'preset_mode') | default('') | lower != 'favorite' }}
+    then:
+      - action: fan.set_preset_mode
+        target:
+          entity_id: !input fan_entity
+        data:
+          preset_mode: favorite
+
+  # 2. Set fan level only when it actually changed
+  - condition: template
+    value_template: "{{ v_final_level | int != v_current_level | int }}"
+
+  - action: number.set_value
+    target:
+      entity_id: !input favorite_level_entity
+    data:
+      value: "{{ v_final_level | int }}"
+
+mode: single
+max_exceeded: silent
