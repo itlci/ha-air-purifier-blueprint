@@ -1,5 +1,5 @@
 blueprint:
-  name: "Xiaomi Air Purifier – Reactive PM2.5 Control"
+  name: "Xiaomi Air Purifier - Reactive PM2.5 Control"
   description: >
     Reactive fan speed control for Xiaomi Air Purifier (via Xiaomi Miot Auto)
     based on real-time PM2.5 readings. Reacts instantly to sensor state changes,
@@ -24,7 +24,7 @@ blueprint:
       name: Favorite Level (number)
       description: >
         Number entity exposed by Xiaomi Miot Auto,
-        usually number.<name>_favorite_level (range 0–14).
+        usually number.<name>_favorite_level (range 0-14).
       selector:
         entity:
           domain: number
