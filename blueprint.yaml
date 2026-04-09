@@ -10,7 +10,7 @@ blueprint:
   author: "ITLCI"
   homeassistant:
     min_version: "2024.6.0"
-  source_url: "https://github.com/ITLCI/ha-air-purifier-blueprint/blob/main/blueprint.yaml"
+  source_url: "https://github.com/itlci/ha-air-purifier-blueprint/blob/main/blueprint.yaml"
   input:
 
     # ── Device ────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ blueprint:
           device_class: pm25
 
     pm25_sensor_fallback:
-      name: PM2.5 Sensor – Fallback (optional)
+      name: PM2.5 Sensor - Fallback (optional)
       description: >
         Used only when the primary sensor is unavailable.
         Leave empty if not needed.
@@ -97,7 +97,9 @@ blueprint:
           step: 1
           unit_of_measurement: "ug/m3"
 
-    # ── Fan Speeds (0–14) ─────────────────────────────────────────────────
+    # ── Fan Speeds ──────────────────────────────────────────────────────────
+    # Range depends on your model (e.g. 0-14 for 3H, 0-17 for Pro).
+    # The purifier will clamp values to its own supported range.
     speed_clean:
       name: "Speed: Clean air"
       description: Fan level when PM2.5 is below moderate threshold
@@ -105,7 +107,7 @@ blueprint:
       selector:
         number:
           min: 0
-          max: 14
+          max: 17
 
     speed_medium:
       name: "Speed: Moderate"
@@ -113,7 +115,7 @@ blueprint:
       selector:
         number:
           min: 1
-          max: 14
+          max: 17
 
     speed_high:
       name: "Speed: High"
@@ -121,7 +123,7 @@ blueprint:
       selector:
         number:
           min: 1
-          max: 14
+          max: 17
 
     speed_very_high:
       name: "Speed: Very High"
@@ -129,7 +131,7 @@ blueprint:
       selector:
         number:
           min: 1
-          max: 14
+          max: 17
 
     # ── Spike Detection / Boost ───────────────────────────────────────────
     spike_delta:
@@ -150,11 +152,60 @@ blueprint:
       description: >
         Fan speed applied when a rapid PM2.5 spike is detected.
         Active for one cycle, then normal zone logic resumes.
-      default: 14
+      default: 17
       selector:
         number:
           min: 1
-          max: 14
+          max: 17
+
+    # ── Window / Door Sensor ─────────────────────────────────────────────
+    window_sensor:
+      name: Window / Door sensor (optional)
+      description: >
+        Binary sensor that is "on" when the window or door is open.
+        Leave empty if not needed.
+      default: ""
+      selector:
+        entity:
+          domain: binary_sensor
+
+    window_action:
+      name: Action when window is open
+      description: >
+        Boost: ramp fan to boost speed (e.g. city with smog).
+        Minimum: drop to clean-air speed to save the filter (e.g. countryside).
+      default: "boost"
+      selector:
+        select:
+          options:
+            - label: "Boost (fight incoming pollution)"
+              value: "boost"
+            - label: "Minimum (save filter, fresh air coming in)"
+              value: "minimum"
+
+    # ── Away / Presence Mode ──────────────────────────────────────────────
+    presence_entity:
+      name: Presence sensor (optional)
+      description: >
+        A person or binary_sensor entity. When state is "not_home"
+        or "off", away mode activates. Leave empty if not needed.
+      default: ""
+      selector:
+        entity:
+          domain:
+            - person
+            - binary_sensor
+
+    away_speed:
+      name: Fan speed when away
+      description: >
+        Fan level used when nobody is home.
+        Set to 0 to turn off the purifier when away.
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 17
 
     # ── Night Mode ────────────────────────────────────────────────────────
     night_mode_enabled:
@@ -184,7 +235,7 @@ blueprint:
       selector:
         number:
           min: 1
-          max: 14
+          max: 17
 
 # ═══════════════════════════════════════════════════════════════════════════
 variables:
@@ -202,6 +253,10 @@ variables:
   v_spd_vhigh: !input speed_very_high
   v_spike_delta: !input spike_delta
   v_spd_boost: !input speed_boost
+  v_window_sensor: !input window_sensor
+  v_window_action: !input window_action
+  v_presence_entity: !input presence_entity
+  v_away_speed: !input away_speed
   v_night_enabled: !input night_mode_enabled
   v_night_start: !input night_start
   v_night_end: !input night_end
@@ -247,7 +302,26 @@ variables:
       {% endif %}
     {% endif %}
 
-  # Spike detection – only when fired by the sensor state trigger
+  # Window open detection
+  v_window_open: >
+    {% if v_window_sensor | string != ''
+       and states(v_window_sensor) not in ['unavailable', 'unknown', 'none', ''] %}
+      {{ is_state(v_window_sensor, 'on') }}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+  # Away detection (person: not_home, binary_sensor: off)
+  v_is_away: >
+    {% if v_presence_entity | string != ''
+       and states(v_presence_entity) not in ['unavailable', 'unknown', 'none', ''] %}
+      {% set s = states(v_presence_entity) %}
+      {{ s == 'not_home' or s == 'off' }}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+  # Spike detection - only when fired by the sensor state trigger
   v_is_spike: >
     {% if trigger is defined
        and trigger.id == 'sensor_update'
@@ -285,15 +359,19 @@ variables:
     {% else                           %} {% set zone_raw = 0 %}
     {% endif %}
 
-    {# Hysteresis: require PM2.5 to drop below (threshold - hysteresis)
-       before stepping down to a lower zone #}
+    {# Hysteresis: step down one zone at a time, checking each boundary.
+       PM2.5 must drop below (threshold - hysteresis) at every intermediate
+       zone before the fan can continue downshifting. #}
     {% if zone_raw < zone_cur %}
       {% set boundaries = [0, v_thr_med | float, v_thr_high | float, v_thr_vhigh | float] %}
-      {% set boundary = boundaries[zone_cur] %}
-      {% if pm < (boundary - h) %}
-        {% set zone_final = zone_raw %}
-      {% else %}
+      {% if pm >= (boundaries[zone_cur] - h) %}
         {% set zone_final = zone_cur %}
+      {% elif (zone_cur - 1) > zone_raw and pm >= (boundaries[zone_cur - 1] - h) %}
+        {% set zone_final = zone_cur - 1 %}
+      {% elif (zone_cur - 2) > zone_raw and pm >= (boundaries[zone_cur - 2] - h) %}
+        {% set zone_final = zone_cur - 2 %}
+      {% else %}
+        {% set zone_final = zone_raw %}
       {% endif %}
     {% else %}
       {% set zone_final = zone_raw %}
@@ -314,14 +392,25 @@ variables:
       {{ v_target_level | int }}
     {% endif %}
 
-  # Final level with night mode cap
+  # Final level: away → window → night cap → device clamp
   v_final_level: >
-    {% set t = v_boosted_level | int %}
-    {% if v_is_night %}
-      {{ [t, v_night_max | int] | min }}
+    {% set dev_min = state_attr(v_fav_entity, 'min') | int(0) %}
+    {% set dev_max = state_attr(v_fav_entity, 'max') | int(17) %}
+    {% if v_is_away %}
+      {% set t = v_away_speed | int %}
+    {% elif v_window_open %}
+      {% if v_window_action == 'boost' %}
+        {% set t = [v_boosted_level | int, v_spd_boost | int] | max %}
+      {% else %}
+        {% set t = v_spd_clean | int %}
+      {% endif %}
     {% else %}
-      {{ t }}
+      {% set t = v_boosted_level | int %}
     {% endif %}
+    {% if v_is_night and not v_window_open %}
+      {% set t = [t, v_night_max | int] | min %}
+    {% endif %}
+    {{ [dev_min, [t, dev_max] | min] | max }}
 
 # ═══════════════════════════════════════════════════════════════════════════
 trigger:
@@ -336,9 +425,9 @@ trigger:
       - "unknown"
     id: "sensor_update"
 
-  # Safety-net periodic re-evaluation (every 5 minutes)
+  # Periodic re-evaluation (catches window, presence, and fallback sensor changes)
   - platform: time_pattern
-    minutes: "/5"
+    minutes: "/1"
     id: "periodic"
 
 # ═══════════════════════════════════════════════════════════════════════════
