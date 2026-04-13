@@ -26,7 +26,7 @@ The stock Auto mode on Xiaomi Air Purifier Pro reacts slowly to pollution spikes
 
 ### Option 1: Import via URL
 
-[![Open your Home Assistant instance and show the blueprint import dialog](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2FITLCI%2Fha-air-purifier-blueprint%2Fblob%2Fmain%2Fblueprint.yaml)
+[![Open your Home Assistant instance and show the blueprint import dialog](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fitlci%2Fha-air-purifier-blueprint%2Fblob%2Fmain%2Fblueprint.yaml)
 
 ### Option 2: Manual
 
@@ -54,8 +54,10 @@ The stock Auto mode on Xiaomi Air Purifier Pro reacts slowly to pollution spikes
 | **Speed: Very High** | 12 | Fan level for very high zone |
 | **Spike threshold** | 15 ug/m3 | Single-update PM2.5 jump that triggers boost (0 = disabled) |
 | **Speed: Boost** | 17 | Fan speed during spike boost |
+| **Boost hold time** | 3 min | How long fan holds elevated speed after spike (0 = one-shot) |
 | **Window sensor** | *(empty)* | Binary sensor for window/door (optional) |
 | **Window action** | boost | What to do when window is open: `boost` or `minimum` |
+| **Window minimum speed** | 1 | Fan level when window open + action is minimum (0 = stop) |
 | **Presence sensor** | *(empty)* | Person or binary_sensor for away detection (optional) |
 | **Away speed** | 1 | Fan level when nobody is home (0 = off) |
 | **Night mode** | enabled | Whether to enforce speed cap at night |
@@ -66,43 +68,43 @@ The stock Auto mode on Xiaomi Air Purifier Pro reacts slowly to pollution spikes
 ## How It Works
 
 ```
-PM2.5 sensor changes value (or periodic tick)
-        │
-        ▼
-  ┌──────────────┐ yes  ┌────────────────┐
-  │ Away mode?   │─────▶│ Use away speed │──────┐
-  └──────┬───────┘      └────────────────┘      │
-         │ no                                    │
-         ▼                                       │
-  ┌──────────────┐ yes  ┌────────────────────┐  │
-  │ Window open? │─────▶│ Boost or minimum   │  │
-  └──────┬───────┘      │ (user configured)  │──┤
-         │ no           └────────────────────┘  │
-         ▼                                       │
-  ┌─────────────┐     ┌──────────────┐          │
-  │ Spike check │────▶│ Boost speed  │          │
-  │ delta >= 15 │ yes └──────┬───────┘          │
-  └──────┬──────┘            │                   │
-         │ no                ▼                   │
-         ▼           ┌──────────────┐           │
-  ┌─────────────┐    │ Take higher  │           │
-  │ Zone logic  │───▶│ of zone/boost│           │
-  │ + hysteresis│    └──────┬───────┘           │
-  └─────────────┘           │                   │
-                            ▼                   │
-                 ┌─────────────────────┐        │
-                 │ Night cap (if not   │◀───────┘
-                 │ window override)    │
-                 └──────────┬──────────┘
-                            ▼
-                 ┌─────────────────────┐
-                 │ Clamp to device     │
-                 │ min/max range       │
-                 └──────────┬──────────┘
-                            ▼
-                 ┌─────────────────────┐
-                 │ Set level if changed│
-                 └─────────────────────┘
+        PM2.5 sensor changes (or periodic tick)
+                 │
+                 ▼
+         ┌───────────────┐  yes  ┌────────────────┐
+         │  Away mode?   │──────▶│ Use away speed │──┐
+         └───────┬───────┘       └────────────────┘  │
+                 │ no                                │
+                 ▼                                   │
+         ┌───────────────┐  yes  ┌────────────────┐  │
+         │ Window open?  │──────▶│ Boost/minimum  │──┤
+         └───────┬───────┘       └────────────────┘  │
+                 │ no                                │
+                 ▼                                   │
+         ┌───────────────┐  yes  ┌────────────────┐  │
+         │ Spike + hold? │──────▶│  Boost speed   │──┤
+         └───────┬───────┘       └────────────────┘  │
+                 │ no                                │
+                 ▼                                   │
+         ┌───────────────┐                           │
+         │  Zone logic   │───────────────────────────┤
+         │ + hysteresis  │                           │
+         └───────┬───────┘                           │
+                 ├───────────────────────────────────┘
+                 ▼
+         ┌───────────────┐
+         │   Night cap   │
+         │ skip if away  │
+         └───────┬───────┘
+                 ▼
+         ┌───────────────┐
+         │ Clamp to dev. │
+         │ min/max range │
+         └───────┬───────┘
+                 ▼
+         ┌───────────────┐
+         │  Apply speed  │
+         └───────────────┘
 ```
 
 ### Trigger Strategy
@@ -116,7 +118,26 @@ When PM2.5 drops, the fan won't immediately downshift. It holds the current zone
 
 ### Spike Detection
 
-If PM2.5 jumps by more than the spike delta in a single sensor update (e.g., someone starts cooking), the fan immediately goes to boost speed. On the next sensor update, normal zone logic resumes - the fan stays high if PM2.5 is still elevated, or ramps down if the spike was brief.
+If PM2.5 jumps by more than the spike delta in a single sensor update (e.g., someone starts cooking), the fan immediately goes to boost speed and holds it for the configured hold time (default: 3 minutes). This prevents rapid cycling when the pollution source is intermittent (vaping, cooking, incense).
+
+## Room Size Presets
+
+The default settings work well for medium-sized rooms (15-30 m2). For smaller or larger rooms, use these presets as a starting point:
+
+| Setting | Small (< 15 m2) | Medium (15-30 m2) | Large (> 30 m2) |
+|---|---|---|---|
+| Threshold: Moderate | 20 | 25 | 20 |
+| Threshold: High | 40 | 50 | 40 |
+| Threshold: Very High | 60 | 75 | 60 |
+| Speed: Clean | 1 | 1 | 3 |
+| Speed: Moderate | 3 | 5 | 7 |
+| Speed: High | 5 | 8 | 12 |
+| Speed: Very High | 8 | 12 | 17 |
+| Hysteresis | 5 | 7 | 5 |
+
+Larger rooms need higher speeds and lower thresholds because the purifier has to work harder to maintain the same air quality. Smaller rooms can use gentler settings to save filter life and reduce noise.
+
+These are suggestions - adjust based on your specific setup, purifier model, and comfort level.
 
 ## License
 

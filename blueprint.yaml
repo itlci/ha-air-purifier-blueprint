@@ -24,7 +24,8 @@ blueprint:
       name: Favorite Level (number)
       description: >
         Number entity exposed by Xiaomi Miot Auto,
-        usually number.<name>_favorite_level (range 0-14).
+        usually number.<name>_favorite_level.
+        Range depends on model (e.g. 0-14 for 3H, 0-17 for Pro).
       selector:
         entity:
           domain: number
@@ -151,12 +152,26 @@ blueprint:
       name: "Speed: Boost"
       description: >
         Fan speed applied when a rapid PM2.5 spike is detected.
-        Active for one cycle, then normal zone logic resumes.
       default: 17
       selector:
         number:
           min: 1
           max: 17
+
+    boost_hold_minutes:
+      name: Boost hold time (minutes)
+      description: >
+        How long the fan holds elevated speed after a spike before
+        returning to normal zone logic. Prevents rapid cycling when
+        the pollution source is intermittent (vaping, cooking, incense).
+        Set to 0 for one-shot boost (no hold).
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1
+          unit_of_measurement: min
 
     # ── Window / Door Sensor ─────────────────────────────────────────────
     window_sensor:
@@ -173,7 +188,7 @@ blueprint:
       name: Action when window is open
       description: >
         Boost: ramp fan to boost speed (e.g. city with smog).
-        Minimum: drop to clean-air speed to save the filter (e.g. countryside).
+        Minimum: drop to window speed below (e.g. countryside, fresh air).
       default: "boost"
       selector:
         select:
@@ -182,6 +197,17 @@ blueprint:
               value: "boost"
             - label: "Minimum (save filter, fresh air coming in)"
               value: "minimum"
+
+    window_minimum_speed:
+      name: Window minimum speed
+      description: >
+        Fan level when window is open and action is "Minimum".
+        Set to 0 to effectively stop the fan.
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 17
 
     # ── Away / Presence Mode ──────────────────────────────────────────────
     presence_entity:
@@ -253,8 +279,10 @@ variables:
   v_spd_vhigh: !input speed_very_high
   v_spike_delta: !input spike_delta
   v_spd_boost: !input speed_boost
+  v_boost_hold: !input boost_hold_minutes
   v_window_sensor: !input window_sensor
   v_window_action: !input window_action
+  v_window_min_speed: !input window_minimum_speed
   v_presence_entity: !input presence_entity
   v_away_speed: !input away_speed
   v_night_enabled: !input night_mode_enabled
@@ -302,21 +330,28 @@ variables:
       {% endif %}
     {% endif %}
 
-  # Window open detection
+  # Window open detection (must be open for > 30s to avoid flicker)
   v_window_open: >
     {% if v_window_sensor | string != ''
-       and states(v_window_sensor) not in ['unavailable', 'unknown', 'none', ''] %}
-      {{ is_state(v_window_sensor, 'on') }}
+       and states(v_window_sensor) not in ['unavailable', 'unknown', 'none', '']
+       and is_state(v_window_sensor, 'on') %}
+      {% set changed = as_timestamp(states[v_window_sensor].last_changed) | float(0) %}
+      {{ (as_timestamp(now()) - changed) > 30 }}
     {% else %}
       {{ false }}
     {% endif %}
 
-  # Away detection (person: not_home, binary_sensor: off)
+  # Away detection (must be away for > 2 min to avoid GPS flicker)
   v_is_away: >
     {% if v_presence_entity | string != ''
        and states(v_presence_entity) not in ['unavailable', 'unknown', 'none', ''] %}
       {% set s = states(v_presence_entity) %}
-      {{ s == 'not_home' or s == 'off' }}
+      {% if s == 'not_home' or s == 'off' %}
+        {% set changed = as_timestamp(states[v_presence_entity].last_changed) | float(0) %}
+        {{ (as_timestamp(now()) - changed) > 120 }}
+      {% else %}
+        {{ false }}
+      {% endif %}
     {% else %}
       {{ false }}
     {% endif %}
@@ -384,12 +419,22 @@ variables:
     {% else                 %} {{ v_spd_vhigh | int }}
     {% endif %}
 
-  # Apply boost if spike detected (take the higher of zone speed and boost)
+  # Apply boost if spike detected, with hold to prevent cycling
   v_boosted_level: >
+    {% set target = v_target_level | int %}
+    {% set cur = v_current_level | int %}
     {% if v_is_spike %}
-      {{ [v_target_level | int, v_spd_boost | int] | max }}
+      {{ [target, v_spd_boost | int] | max }}
+    {% elif cur > target and v_boost_hold | int > 0 %}
+      {% set changed = as_timestamp(states[v_fav_entity].last_changed) | float(0) %}
+      {% set age = as_timestamp(now()) - changed %}
+      {% if age < (v_boost_hold | int * 60) %}
+        {{ cur }}
+      {% else %}
+        {{ target }}
+      {% endif %}
     {% else %}
-      {{ v_target_level | int }}
+      {{ target }}
     {% endif %}
 
   # Final level: away → window → night cap → device clamp
@@ -402,12 +447,12 @@ variables:
       {% if v_window_action == 'boost' %}
         {% set t = [v_boosted_level | int, v_spd_boost | int] | max %}
       {% else %}
-        {% set t = v_spd_clean | int %}
+        {% set t = v_window_min_speed | int %}
       {% endif %}
     {% else %}
       {% set t = v_boosted_level | int %}
     {% endif %}
-    {% if v_is_night and not v_window_open %}
+    {% if v_is_night and not v_window_open and not v_is_away %}
       {% set t = [t, v_night_max | int] | min %}
     {% endif %}
     {{ [dev_min, [t, dev_max] | min] | max }}
